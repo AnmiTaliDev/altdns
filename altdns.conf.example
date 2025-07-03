@@ -1,0 +1,14 @@
+[resolver]
+listen = 127.0.0.1:5353
+upstream = 8.8.8.8:53
+cache_size = 1000
+cache_ttl = 300
+timeout = 5
+
+[logging]
+level = info
+
+[performance]
+max_concurrent = 1000
+buffer_size = 512
+stats = true
