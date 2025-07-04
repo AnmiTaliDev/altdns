@@ -15,11 +15,24 @@ pub struct ResolverConfig {
     pub max_retries: u32,
 }
 
+/// Конфигурация безопасности
+#[derive(Debug, Clone)]
+pub struct SecurityConfig {
+    pub enable_dnssec: bool,
+    pub require_dnssec: bool,
+    pub enable_filtering: bool,
+    pub block_ads: bool,
+    pub block_malware: bool,
+    pub blocklist_path: String,
+    pub whitelist_path: String,
+}
+
 /// Конфигурация логирования
 #[derive(Debug, Clone)]
 pub struct LogConfig {
     pub level: String,
     pub file: Option<String>,
+    pub use_syslog: bool,
 }
 
 /// Конфигурация производительности
@@ -34,6 +47,7 @@ pub struct PerformanceConfig {
 #[derive(Debug, Clone)]
 pub struct AltDnsConfig {
     pub resolver: ResolverConfig,
+    pub security: SecurityConfig,
     pub logging: LogConfig,
     pub performance: PerformanceConfig,
 }
@@ -51,11 +65,26 @@ impl Default for ResolverConfig {
     }
 }
 
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            enable_dnssec: true,
+            require_dnssec: false,
+            enable_filtering: true,
+            block_ads: true,
+            block_malware: true,
+            blocklist_path: "/etc/altdns/blocklist.txt".to_string(),
+            whitelist_path: "/etc/altdns/whitelist.txt".to_string(),
+        }
+    }
+}
+
 impl Default for LogConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
             file: None,
+            use_syslog: false,
         }
     }
 }
@@ -74,6 +103,7 @@ impl Default for AltDnsConfig {
     fn default() -> Self {
         Self {
             resolver: ResolverConfig::default(),
+            security: SecurityConfig::default(),
             logging: LogConfig::default(),
             performance: PerformanceConfig::default(),
         }
@@ -97,6 +127,11 @@ impl AltDnsConfig {
         // Загружаем секцию [resolver]
         if let Some(resolver_section) = ini.get_map_ref().get("resolver") {
             config.resolver = Self::parse_resolver_config(resolver_section)?;
+        }
+        
+        // Загружаем секцию [security]
+        if let Some(security_section) = ini.get_map_ref().get("security") {
+            config.security = Self::parse_security_config(security_section)?;
         }
         
         // Загружаем секцию [logging]
@@ -162,6 +197,48 @@ impl AltDnsConfig {
         Ok(config)
     }
     
+    /// Парсит секцию [security]
+    fn parse_security_config(
+        section: &std::collections::HashMap<String, Option<String>>
+    ) -> Result<SecurityConfig, ConfigError> {
+        let mut config = SecurityConfig::default();
+        
+        if let Some(Some(enable_dnssec)) = section.get("enable_dnssec") {
+            config.enable_dnssec = enable_dnssec.parse()
+                .map_err(|e: std::str::ParseBoolError| ConfigError::InvalidValue("enable_dnssec".to_string(), e.to_string()))?;
+        }
+        
+        if let Some(Some(require_dnssec)) = section.get("require_dnssec") {
+            config.require_dnssec = require_dnssec.parse()
+                .map_err(|e: std::str::ParseBoolError| ConfigError::InvalidValue("require_dnssec".to_string(), e.to_string()))?;
+        }
+        
+        if let Some(Some(enable_filtering)) = section.get("enable_filtering") {
+            config.enable_filtering = enable_filtering.parse()
+                .map_err(|e: std::str::ParseBoolError| ConfigError::InvalidValue("enable_filtering".to_string(), e.to_string()))?;
+        }
+        
+        if let Some(Some(block_ads)) = section.get("block_ads") {
+            config.block_ads = block_ads.parse()
+                .map_err(|e: std::str::ParseBoolError| ConfigError::InvalidValue("block_ads".to_string(), e.to_string()))?;
+        }
+        
+        if let Some(Some(block_malware)) = section.get("block_malware") {
+            config.block_malware = block_malware.parse()
+                .map_err(|e: std::str::ParseBoolError| ConfigError::InvalidValue("block_malware".to_string(), e.to_string()))?;
+        }
+        
+        if let Some(Some(blocklist)) = section.get("blocklist") {
+            config.blocklist_path = blocklist.clone();
+        }
+        
+        if let Some(Some(whitelist)) = section.get("whitelist") {
+            config.whitelist_path = whitelist.clone();
+        }
+        
+        Ok(config)
+    }
+    
     /// Парсит секцию [logging]
     fn parse_logging_config(
         section: &std::collections::HashMap<String, Option<String>>
@@ -185,6 +262,11 @@ impl AltDnsConfig {
         
         if let Some(Some(file)) = section.get("file") {
             config.file = Some(file.clone());
+        }
+        
+        if let Some(Some(use_syslog)) = section.get("use_syslog") {
+            config.use_syslog = use_syslog.parse()
+                .map_err(|e: std::str::ParseBoolError| ConfigError::InvalidValue("use_syslog".to_string(), e.to_string()))?;
         }
         
         Ok(config)

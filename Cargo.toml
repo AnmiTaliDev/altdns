@@ -1,6 +1,6 @@
 [package]
 name = "altdns"
-version = "0.1.1"
+version = "0.1.0"
 edition = "2021"
 authors = ["AnmiTaliDev <annmitali198@gmail.com>"]
 description = "A lightweight, microkernel-based DNS resolver alternative to systemd-resolved"
@@ -11,13 +11,14 @@ keywords = ["dns", "resolver", "systemd", "networking", "microkernel"]
 categories = ["network-programming", "command-line-utilities"]
 
 [dependencies]
-tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "sync", "signal"] }
-trust-dns-resolver = "0.23"
+tokio = { version = "1.0", features = ["net", "rt-multi-thread", "macros", "sync", "signal", "fs", "time"] }
 configparser = "3.0"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 thiserror = "1.0"
 futures = "0.3"
+syslog = "6.0"
+regex = "1.0"
 
 [dev-dependencies]
 tempfile = "3.0"
