@@ -2,13 +2,13 @@ mod config;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{RwLock, Semaphore};
 use trust_dns_resolver::config::{ResolverConfig, ResolverOpts};
 use trust_dns_resolver::TokioAsyncResolver;
 use tracing::{info, warn, error, debug};
-use config::{AltDnsConfig, ConfigError};
+use crate::config::{AltDnsConfig, ConfigError};
 
 // DNS парсинг структуры
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -35,6 +35,48 @@ pub struct QueryStats {
     pub upstream_timeouts: u64,
     pub upstream_errors: u64,
     pub parse_errors: u64,
+    pub failover_switches: u64,
+}
+
+// Структура для отслеживания состояния upstream серверов
+#[derive(Debug, Clone)]
+struct UpstreamServer {
+    address: String,
+    failures: u32,
+    last_failure: Option<Instant>,
+}
+
+impl UpstreamServer {
+    fn new(address: String) -> Self {
+        Self {
+            address,
+            failures: 0,
+            last_failure: None,
+        }
+    }
+    
+    fn is_healthy(&self) -> bool {
+        // Сервер считается здоровым если:
+        // 1. Нет недавних ошибок (< 3 за последние 60 секунд)
+        // 2. Или прошло больше 60 секунд с последней ошибки
+        if let Some(last_failure) = self.last_failure {
+            let time_since_failure = Instant::now().duration_since(last_failure);
+            if time_since_failure < Duration::from_secs(60) {
+                return self.failures < 3;
+            }
+        }
+        true
+    }
+    
+    fn record_failure(&mut self) {
+        self.failures += 1;
+        self.last_failure = Some(Instant::now());
+    }
+    
+    fn record_success(&mut self) {
+        self.failures = 0;
+        self.last_failure = None;
+    }
 }
 
 // Основная структура DNS сервера
@@ -44,6 +86,7 @@ pub struct AltDns {
     config: AltDnsConfig,
     semaphore: Arc<Semaphore>,
     stats: Arc<RwLock<QueryStats>>,
+    upstream_servers: Arc<RwLock<Vec<UpstreamServer>>>,
 }
 
 impl AltDns {
@@ -53,8 +96,9 @@ impl AltDns {
         // Валидируем конфигурацию
         config.validate().map_err(|e| format!("Config validation failed: {}", e))?;
         
-        // Создаем resolver с custom upstream
-        let upstream_parts: Vec<&str> = config.resolver.upstream_server.split(':').collect();
+        // Создаем resolver с первым upstream сервером
+        let first_upstream = config.resolver.upstream_servers[0].clone();
+        let upstream_parts: Vec<&str> = first_upstream.split(':').collect();
         let upstream_ip = upstream_parts[0].parse()?;
         let upstream_port = if upstream_parts.len() > 1 {
             upstream_parts[1].parse().unwrap_or(53)
@@ -74,11 +118,22 @@ impl AltDns {
         
         let resolver = TokioAsyncResolver::tokio(resolver_config, ResolverOpts::default());
         
+        // Инициализируем upstream серверы
+        let upstream_servers: Vec<UpstreamServer> = config.resolver.upstream_servers
+            .iter()
+            .map(|addr| UpstreamServer::new(addr.clone()))
+            .collect();
+        
+        info!("Configured {} upstream servers: {:?}", 
+              upstream_servers.len(), 
+              config.resolver.upstream_servers);
+        
         Ok(AltDns {
             cache: Arc::new(RwLock::new(HashMap::new())),
             resolver,
             semaphore: Arc::new(Semaphore::new(config.performance.max_concurrent)),
             stats: Arc::new(RwLock::new(QueryStats::default())),
+            upstream_servers: Arc::new(RwLock::new(upstream_servers)),
             config,
         })
     }
@@ -151,8 +206,109 @@ impl AltDns {
         data
     }
     
+    // Выбор лучшего upstream сервера с поддержкой failover
+    async fn get_best_upstream(&self) -> String {
+        let servers = self.upstream_servers.read().await;
+        
+        // Сначала пробуем найти здоровый сервер
+        for server in servers.iter() {
+            if server.is_healthy() {
+                return server.address.clone();
+            }
+        }
+        
+        // Если все серверы нездоровы, берем первый (fallback)
+        if let Some(server) = servers.first() {
+            return server.address.clone();
+        }
+        
+        // Последний fallback на Google DNS
+        "8.8.8.8:53".to_string()
+    }
+    
+    // Отметить успешный запрос к серверу
+    async fn record_upstream_success(&self, server_addr: &str) {
+        let mut servers = self.upstream_servers.write().await;
+        for server in servers.iter_mut() {
+            if server.address == server_addr {
+                server.record_success();
+                break;
+            }
+        }
+    }
+    
+    // Отметить ошибку запроса к серверу
+    async fn record_upstream_failure(&self, server_addr: &str) {
+        let mut servers = self.upstream_servers.write().await;
+        for server in servers.iter_mut() {
+            if server.address == server_addr {
+                server.record_failure();
+                debug!("Upstream {} marked as unhealthy (failures: {})", server_addr, server.failures);
+                break;
+            }
+        }
+    }
+    
+    // Попытка запроса к upstream серверу с retry логикой
+    async fn try_upstream_query(
+        &self, 
+        query_data: &[u8], 
+        dns_query: &DnsQuery
+    ) -> Result<Vec<u8>, String> {
+        let max_retries = self.config.resolver.max_retries;
+        let timeout = self.config.resolver.timeout;
+        
+        for attempt in 0..=max_retries {
+            let upstream_addr = self.get_best_upstream().await;
+            debug!("Attempting query to {} (attempt {}/{})", upstream_addr, attempt + 1, max_retries + 1);
+            
+            let upstream_socket = match UdpSocket::bind("0.0.0.0:0").await {
+                Ok(socket) => socket,
+                Err(e) => {
+                    error!("Failed to bind socket: {}", e);
+                    continue;
+                }
+            };
+            
+            // Отправляем запрос
+            if let Err(e) = upstream_socket.send_to(query_data, &upstream_addr).await {
+                error!("Failed to send to {}: {}", upstream_addr, e);
+                self.record_upstream_failure(&upstream_addr).await;
+                continue;
+            }
+            
+            // Получаем ответ с таймаутом
+            let mut response_buf = vec![0u8; self.config.performance.buffer_size];
+            match tokio::time::timeout(timeout, upstream_socket.recv(&mut response_buf)).await {
+                Ok(Ok(response_size)) => {
+                    let response_data = response_buf[..response_size].to_vec();
+                    self.record_upstream_success(&upstream_addr).await;
+                    debug!("Successful response from {} for {}", upstream_addr, dns_query.name);
+                    return Ok(response_data);
+                }
+                Ok(Err(e)) => {
+                    error!("Socket error from {}: {}", upstream_addr, e);
+                    self.record_upstream_failure(&upstream_addr).await;
+                }
+                Err(_) => {
+                    warn!("Timeout from {} for {} (attempt {})", upstream_addr, dns_query.name, attempt + 1);
+                    self.record_upstream_failure(&upstream_addr).await;
+                }
+            }
+            
+            // Если не последняя попытка, проверим failover
+            if attempt < max_retries {
+                let mut stats_write = self.stats.write().await;
+                stats_write.failover_switches += 1;
+                debug!("Switching to next upstream server for {}", dns_query.name);
+            }
+        }
+        
+        Err(format!("All upstream servers failed for {}", dns_query.name))
+    }
+    
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let socket = Arc::new(UdpSocket::bind(&self.config.resolver.listen_addr).await?);
+        let socket: Arc<UdpSocket> = Arc::new(UdpSocket::bind(&self.config.resolver.listen_addr).await?);
         info!("AltDns listening on {}", self.config.resolver.listen_addr);
         
         let mut buf = vec![0u8; self.config.performance.buffer_size];
@@ -180,14 +336,23 @@ impl AltDns {
                     let socket = socket.clone();
                     let config = self.config.clone();
                     let stats = self.stats.clone();
+                    let upstream_servers = self.upstream_servers.clone();
+                    
+                    let altdns_instance = AltDns {
+                        cache: cache.clone(),
+                        resolver,
+                        config: config.clone(),
+                        semaphore: self.semaphore.clone(),
+                        stats: stats.clone(),
+                        upstream_servers,
+                    };
                     
                     // Обрабатываем каждый запрос в отдельной задаче
                     tokio::spawn(async move {
-                        if let Err(e) = Self::handle_query(
+                        if let Err(e) = altdns_instance.handle_query(
                             query_data,
                             client_addr,
                             cache,
-                            resolver,
                             socket,
                             config,
                             stats,
@@ -208,7 +373,7 @@ impl AltDns {
     async fn start_cache_cleaner(&self) -> tokio::task::JoinHandle<()> {
         let cache = self.cache.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 let mut cache_write = cache.write().await;
@@ -223,20 +388,21 @@ impl AltDns {
     async fn start_stats_printer(&self) -> tokio::task::JoinHandle<()> {
         let stats = self.stats.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // каждые 5 минут
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // каждые 5 минут
             loop {
                 interval.tick().await;
                 let stats_read = stats.read().await;
                 if stats_read.total_queries > 0 {
                     let cache_hit_rate = (stats_read.cache_hits as f64 / stats_read.total_queries as f64) * 100.0;
-                    info!("Stats: total={}, cache_hits={}, cache_misses={}, hit_rate={:.1}%, timeouts={}, errors={}, parse_errors={}", 
+                    info!("Stats: total={}, cache_hits={}, cache_misses={}, hit_rate={:.1}%, timeouts={}, errors={}, parse_errors={}, failovers={}", 
                         stats_read.total_queries,
                         stats_read.cache_hits,
                         stats_read.cache_misses,
                         cache_hit_rate,
                         stats_read.upstream_timeouts,
                         stats_read.upstream_errors,
-                        stats_read.parse_errors
+                        stats_read.parse_errors,
+                        stats_read.failover_switches
                     );
                 }
             }
@@ -244,10 +410,10 @@ impl AltDns {
     }
     
     async fn handle_query(
+        &self,
         query_data: Vec<u8>,
         client_addr: std::net::SocketAddr,
         cache: Arc<RwLock<HashMap<DnsQuery, CacheEntry>>>,
-        _resolver: TokioAsyncResolver,
         socket: Arc<UdpSocket>,
         config: AltDnsConfig,
         stats: Arc<RwLock<QueryStats>>,
@@ -302,19 +468,9 @@ impl AltDns {
             stats_write.cache_misses += 1;
         }
         
-        // Форвардим запрос к upstream серверу
-        let upstream_socket = UdpSocket::bind("0.0.0.0:0").await?;
-        upstream_socket.send_to(&query_data, &config.resolver.upstream_server).await?;
-        
-        // Получаем ответ от upstream
-        let mut response_buf = vec![0u8; config.performance.buffer_size];
-        match tokio::time::timeout(
-            config.resolver.timeout,
-            upstream_socket.recv(&mut response_buf)
-        ).await {
-            Ok(Ok(response_size)) => {
-                let response_data = response_buf[..response_size].to_vec();
-                
+        // Форвардим запрос к upstream серверам с failover
+        match self.try_upstream_query(&query_data, &dns_query).await {
+            Ok(response_data) => {
                 // Кэшируем ответ
                 {
                     let mut cache_write = cache.write().await;
@@ -338,15 +494,10 @@ impl AltDns {
                 socket.send_to(&response_data, client_addr).await?;
                 debug!("Forwarded response for {} to {}", dns_query.name, client_addr);
             }
-            Ok(Err(e)) => {
-                error!("Error receiving from upstream: {}", e);
+            Err(e) => {
+                error!("All upstream servers failed: {}", e);
                 let mut stats_write = stats.write().await;
                 stats_write.upstream_errors += 1;
-            }
-            Err(_) => {
-                warn!("Timeout waiting for upstream response for {}", dns_query.name);
-                let mut stats_write = stats.write().await;
-                stats_write.upstream_timeouts += 1;
             }
         }
         

@@ -8,10 +8,11 @@ use tracing::{info, warn, error};
 #[derive(Debug, Clone)]
 pub struct ResolverConfig {
     pub listen_addr: SocketAddr,
-    pub upstream_server: String,
+    pub upstream_servers: Vec<String>,
     pub cache_size: usize,
     pub cache_ttl: Duration,
     pub timeout: Duration,
+    pub max_retries: u32,
 }
 
 /// Конфигурация логирования
@@ -41,10 +42,11 @@ impl Default for ResolverConfig {
     fn default() -> Self {
         Self {
             listen_addr: "127.0.0.1:53".parse().unwrap(),
-            upstream_server: "8.8.8.8:53".to_string(),
+            upstream_servers: vec!["8.8.8.8:53".to_string(), "1.1.1.1:53".to_string()],
             cache_size: 1000,
             cache_ttl: Duration::from_secs(300), // 5 минут
             timeout: Duration::from_secs(5),
+            max_retries: 2,
         }
     }
 }
@@ -123,7 +125,16 @@ impl AltDnsConfig {
         }
         
         if let Some(Some(upstream)) = section.get("upstream") {
-            config.upstream_server = upstream.clone();
+            // Парсим список серверов, разделенных запятыми
+            config.upstream_servers = upstream
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            
+            if config.upstream_servers.is_empty() {
+                config.upstream_servers = vec!["8.8.8.8:53".to_string()];
+            }
         }
         
         if let Some(Some(cache_size)) = section.get("cache_size") {
@@ -141,6 +152,11 @@ impl AltDnsConfig {
             let timeout_seconds: u64 = timeout.parse()
                 .map_err(|e: std::num::ParseIntError| ConfigError::InvalidValue("timeout".to_string(), e.to_string()))?;
             config.timeout = Duration::from_secs(timeout_seconds);
+        }
+        
+        if let Some(Some(max_retries)) = section.get("max_retries") {
+            config.max_retries = max_retries.parse()
+                .map_err(|e: std::num::ParseIntError| ConfigError::InvalidValue("max_retries".to_string(), e.to_string()))?;
         }
         
         Ok(config)
@@ -205,9 +221,20 @@ impl AltDnsConfig {
             return Err(ConfigError::ValidationError("Invalid listen port".to_string()));
         }
         
-        // Проверяем upstream сервер
-        if self.resolver.upstream_server.is_empty() {
-            return Err(ConfigError::ValidationError("Upstream server cannot be empty".to_string()));
+        // Проверяем upstream серверы
+        if self.resolver.upstream_servers.is_empty() {
+            return Err(ConfigError::ValidationError("At least one upstream server must be specified".to_string()));
+        }
+        
+        // Валидируем формат upstream серверов
+        for server in &self.resolver.upstream_servers {
+            if server.is_empty() {
+                return Err(ConfigError::ValidationError("Upstream server cannot be empty".to_string()));
+            }
+            // Попробуем парсить server:port формат
+            if !server.contains(':') {
+                return Err(ConfigError::ValidationError(format!("Invalid upstream server format: {}", server)));
+            }
         }
         
         // Проверяем размер кэша
